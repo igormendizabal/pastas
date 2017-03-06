@@ -49,28 +49,103 @@ class LeastSquares:
                                    model.oseries_calib)
 
 
-class LmfitSolve:
-    def __init__(self, model, tmin=None, tmax=None, noise=True, freq='D'):
-        # Deal with the parameters
-        parameters = lmfit.Parameters()
-        p = model.parameters[['initial', 'pmin', 'pmax', 'vary']]
-        for k in p.index:
-            pp = np.where(np.isnan(p.loc[k]), None, p.loc[k])
-            parameters.add(k, value=pp[0], min=pp[1], max=pp[2], vary=pp[3])
+def params_to_array(objfunc):
+    """Objective function wrapper for lmfit.
+    Unpacking lmfit.Parameters object to array before passing to
+    objective function.
 
-        self.fit = lmfit.minimize(fcn=self.objfunction, params=parameters,
-                                  ftol=1e-3, epsfcn=1e-4,
-                                  args=(tmin, tmax, noise, model, freq))
-        self.optimal_params = np.array([p.value for p in
-                                        self.fit.params.values()])
-        self.report = lmfit.fit_report(self.fit)
+    Parameters
+    ----------
+    objfunc : function
+        objective function
 
-    def objfunction(self, parameters, tmin, tmax, noise, model, freq):
+    Returns
+    -------
+    function
+        wrapped objective function taking parameter values as array
+    """
+    def wrapper(parameters, *args, **kwargs):
         p = np.array([p.value for p in parameters.values()])
-        if noise:
-            return model.innovations(p, tmin, tmax, freq, model.oseries_calib)
-        else:
-            return model.residuals(p, tmin, tmax, freq, model.oseries_calib)
+        return objfunc(p, *args, **kwargs)
+    return wrapper
+
+
+class Fit(object):
+    """Generic fit class containing the solver results
+
+    Attributes
+    ----------
+    optimal_params : np.array
+        Array with optimal parameter values
+    report : str
+        fit report string
+    """
+    def __init__(self, optimal_params, report):
+        self.optimal_params = optimal_params
+        self.report = report
+
+
+class LmfitSolve:
+    def __init__(self, parameters, ftol=1e-3, epsfcn=1e-4):
+        """Solver based on lmfit
+
+        Parameters
+        ----------
+        parameters : pd.DataFrame
+            DataFrame with parameter bounds and initial values
+        ftol : float, optional
+            Relative error in the desired sum of squares
+            see: http://cars9.uchicago.edu/software/python/lmfit/fitting.html
+        epsfcn : float, optional
+            variable used in determining a suitable step length for the forward- difference approximation of the Jacobian
+            see: https://docs.scipy.org/doc/scipy-0.18.1/reference/generated/scipy.optimize.leastsq.html
+        """
+        self.ftol = ftol
+        self.epsfcn = epsfcn
+
+        # deal with parameters
+        self.parameters = lmfit.Parameters()
+        solve_params = parameters[['initial', 'pmin', 'pmax', 'vary']]
+        for param_name, param_values in solve_params.iterrows():
+
+            # set NaN to None
+            param_kwargs = {k: None if np.isnan(v) else v
+                for k, v in param_values.items()}
+
+            # rename parameter kwargs
+            param_kwargs.update({'value': param_kwargs.pop('initial')})
+            param_kwargs.update({'min': param_kwargs.pop('pmin')})
+            param_kwargs.update({'max': param_kwargs.pop('pmax')})
+
+            # add to parameters
+            self.parameters.add(param_name, **param_kwargs)
+
+    def solve(self, objfunc, *objfunc_args, **objfunc_kwargs):
+        """Solve using objective functions
+
+        Parameters
+        ----------
+        objfunc : function
+            Objective function to be evaluated using lmfit.minize
+        *objfunc_args
+            Additional positional arguments for objective function
+        **objfunc_kwargs
+            Additional keyword arguments for objective function
+
+        """
+
+        # deploy minimize using objfunc
+        fit = lmfit.minimize(fcn=params_to_array(objfunc),
+                             params=self.parameters,
+                             ftol=self.ftol, epsfcn=self.epsfcn,
+                             args=objfunc_args,
+                             kws=objfunc_kwargs)
+
+        # assign output attributes
+        optimal_params = np.array([p.value for p in fit.params.values()])
+        report = lmfit.fit_report(fit)
+
+        return Fit(optimal_params, report=report)
 
 
 from scipy.optimize import differential_evolution
@@ -111,3 +186,5 @@ class DESolve:
                                        h_observed=self.model.oseries_calib)
 
         return sum(res ** 2)
+
+

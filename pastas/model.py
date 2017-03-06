@@ -9,6 +9,7 @@ import pandas as pd
 from scipy import interpolate
 
 from .checks import check_oseries
+from .objfunc import residuals as objf_residuals
 from .solver import LmfitSolve
 from .stats import Statistics
 from .tseries import Constant
@@ -208,38 +209,46 @@ class Model:
         if parameters is None:
             parameters = self.get_parameters()
 
-        h = pd.Series(data=0, index=sim_index)
+        h = np.zeros(len(sim_index))
         istart = 0  # Track parameters index to pass to ts object
         for ts in self.tseriesdict.values():
             c = ts.simulate(parameters[istart: istart + ts.nparam], sim_index,
                             dt)
-            h = h.add(c, fill_value=0.0)
+            h += c.values # no need to match on index, all tseries are on sim_index
             istart += ts.nparam
+
         if self.constant:
             h += self.constant.simulate(parameters[istart])
 
-        return h[tmin:]
+        # convert to Pandas Series
+        h = pd.Series(h, index=sim_index)
+
+        return h.loc[tmin:]
 
     def residuals(self, parameters=None, tmin=None, tmax=None, freq=None,
-                  h_observed=None):
-        """Calculate the residual series.
+                  h_observed=None, sample_method='nearest'):
+        """Calculate residual series
 
         Parameters
         ----------
-        parameters: Optional[list]
-            Array of the parameters used in the time series model.
-        tmin: Optional[str]
-        tmax: Optional[str]
-        freq: Optional[str]
-            frequency at which the time series are simulated.
-        h_observed: Optional[pd.Series]
+        parameters : None, optional
+            Array of parameter values
+        tmin : None, optional
+            Description
+        tmax : None, optional
+            Description
+        freq : None, optional
+            Frequency at which the time series are simulated.
+        h_observed : None, optional
             Pandas series containing the observed values.
+        sample_method : str, optional
+            Sample method used for matching simulation to observations
+            before calculating residuals.
 
         Returns
         -------
-        res: pd.Series
-            Pandas series with the residuals series.
-
+        TYPE
+            Description
         """
         if freq is None:
             freq = self.freq
@@ -247,31 +256,16 @@ class Model:
         tmin, tmax = self.get_tmin_tmax(tmin, tmax, freq, use_oseries=True)
 
         # simulate model
-        simulation = self.simulate(parameters, tmin, tmax, freq)
+        simulated = self.simulate(parameters, tmin, tmax, freq)
 
         if h_observed is None:
-            h_observed = self.oseries[tmin: tmax]
-            # sample measurements, so that frequency is not higher than model
-            h_observed = self.sample(h_observed, simulation.index)
-            # store this variable in the model, so that it can be used in the
-            # next iteration of the solver
+            h_observed = self.oseries.loc[tmin:tmax]
             self.oseries_calib = h_observed
-
-        obs_index = h_observed.index  # times used for calibration
-
-        # Get h_simulated at the correct indices
-        if obs_index.difference(simulation.index).size == 0:
-            # all of the observation indexes are in the simulation
-            h_simulated = simulation[obs_index]
-        else:
-            # interpolate simulation to measurement-times
-            h_simulated = np.interp(h_observed.index.asi8,
-                                    simulation.index.asi8, simulation)
+        h_simulated = (simulated
+                       .reindex_like(h_observed, method=sample_method))
         res = h_observed - h_simulated
 
-        if np.isnan(sum(res ** 2)):
-            print('nan problem in residuals')  # quick and dirty check
-        return res[tmin:]
+        return res.loc[tmin:].dropna()
 
     def innovations(self, parameters=None, tmin=None, tmax=None, freq=None,
                     h_observed=None):
@@ -316,7 +310,7 @@ class Model:
         v = self.noisemodel.simulate(res, self.odelt[res.index],
                                      parameters[-self.noisemodel.nparam:],
                                      res.index)
-        return v[tmin:]
+        return v.loc[tmin:]
 
     def observations(self, tmin=None, tmax=None):
         """Method that returns the observations series.
@@ -324,7 +318,7 @@ class Model:
         """
         tmin, tmax = self.get_tmin_tmax(tmin, tmax, use_oseries=True)
 
-        return self.oseries[tmin: tmax]
+        return self.oseries.loc[tmin: tmax]
 
     def initialize(self, initial=True, noise=True):
         """Initialize the model before solving.
@@ -354,8 +348,9 @@ class Model:
         if not initial:
             self.parameters.initial = optimal
 
-    def solve(self, tmin=None, tmax=None, solver=LmfitSolve, report=True,
-              noise=True, initial=True):
+    def solve(self, tmin=None, tmax=None,
+              solver=LmfitSolve, objfunc=objf_residuals,
+              report=True, noise=True, initial=True):
         """
         Methods to solve the time series model.
 
@@ -389,10 +384,13 @@ class Model:
         self.initialize(initial=initial, noise=noise)
 
         # Solve model
-        fit = solver(self, tmin=self.tmin, tmax=self.tmax, noise=noise,
-                     freq=self.freq)
+        solver = solver(self.parameters)
 
-        self.fit = fit.fit
+        objfunc_kwargs= {'tmin': self.tmin, 'tmax': self.tmax,
+            'noise': noise, 'freq': self.freq}
+
+        self.fit = solver.solve(objfunc, self, **objfunc_kwargs)
+
         self.parameters.optimal = fit.optimal_params
         self.report = fit.report
         if report: print(self.report)
@@ -486,8 +484,10 @@ class Model:
         # adjust tmin and tmax so that the time-offset is equal to the tseries.
         if not freq:
             freq = self.freq
-        tmin = tmin - self.get_time_offset(tmin, freq) + self.time_offset
-        tmax = tmax - self.get_time_offset(tmax, freq) + self.time_offset
+
+        offset = pd.tseries.frequencies.to_offset(freq)
+        tmin = offset.rollforward(tmin).normalize()
+        tmax = offset.rollback(tmax).normalize()
 
         assert tmax > tmin, \
             'Error: Specified tmax not larger than specified tmin'
@@ -517,8 +517,7 @@ class Model:
             if not tseries.stress.empty:
                 freqs.add(tseries.freq)
                 # calculate the offset from the default frequency
-                time_offset = self.get_time_offset(tseries.stress.index[0],
-                                                   tseries.freq)
+                time_offset = pd.tseries.frequencies.to_offset(tseries.freq)
                 time_offsets.add(time_offset)
 
         # 1. The frequency should be the same for all tseries
@@ -583,99 +582,36 @@ class Model:
         return parameters.values
 
     def get_dt(self, freq):
-        options = {'W': 7,  # weekly frequency
-                   'D': 1,  # calendar day frequency
-                   'H': 1 / 24,  # hourly frequency
-                   'T': 1 / 24 / 60,  # minutely frequency
-                   'min': 1 / 24 / 60,  # minutely frequency
-                   'S': 1 / 24 / 3600,  # secondly frequency
-                   'L': 1 / 24 / 3600000,  # milliseconds
-                   'ms': 1 / 24 / 3600000,  # milliseconds
-                   }
-        # Get the frequency string and multiplier
-        num, freq = self.get_freqstr(freq)
-        dt = num * options[freq]
-        return dt
-
-    def get_time_offset(self, t, freq):
-        if isinstance(t, pd.Series):
-            # Take the first timestep. The rest of index has the same offset,
-            # as the frequency is constant.
-            t = t.index[0]
-
-        # define the function blocks
-        def calc_week_offset(t):
-            return datetime.timedelta(days=t.weekday(), hours=t.hour,
-                                      minutes=t.minute, seconds=t.second)
-
-        def calc_day_offset(t):
-            return datetime.timedelta(hours=t.hour, minutes=t.minute,
-                                      seconds=t.second)
-
-        def calc_hour_offset(t):
-            return datetime.timedelta(minutes=t.minute, seconds=t.second)
-
-        def calc_minute_offset(t):
-            return datetime.timedelta(seconds=t.second)
-
-        def calc_second_offset(t):
-            return datetime.timedelta(microseconds=t.microsecond)
-
-        def calc_millisecond_offset(t):
-            # t has no millisecond attribute, so use microsecond and use the remainder after division by 1000
-            return datetime.timedelta(microseconds=t.microsecond % 1000.0)
-
-        # map the inputs to the function blocks
-        # see http://pandas.pydata.org/pandas-docs/stable/timeseries.html#timeseries-offset-aliases
-        options = {'W': calc_week_offset,  # weekly frequency
-                   'D': calc_day_offset,  # calendar day frequency
-                   'H': calc_hour_offset,  # hourly frequency
-                   'T': calc_minute_offset,  # minutely frequency
-                   'min': calc_minute_offset,  # minutely frequency
-                   'S': calc_second_offset,  # secondly frequency
-                   'L': calc_millisecond_offset,  # milliseconds
-                   'ms': calc_millisecond_offset,  # milliseconds
-                   }
-        # Get the frequency string and multiplier
-        num, freq = self.get_freqstr(freq)
-        offset = num * options[freq](t)
-        return offset
-
-    def get_freqstr(self, freqstr):
-        """Method to untangle the frequency string.
+        """Summary
 
         Parameters
         ----------
-        freqstr: str
-            string with the frequency as defined by the pandas package,
-            possibly containing a numerical value.
+        freq : str
+            Pandas frequency string
 
         Returns
         -------
-        num: int
-            integer by which to multiply the frequency. 1 is returned if no
-            num is present in the string that has been provided.
-        freq: str
-            String with the frequency as defined by the pandas package.
-
+        float
+            Frequency time offset in decimal days
         """
-        # remove the day from the week
-        freqstr = freqstr.split("-", 1)[0]
+        offset = pd.tseries.frequencies.to_offset(freq)
 
-        # Find a number by which the frequency is multiplied
-        num = ''
-        freq = ''
-        for s in freqstr:
-            if s.isdigit():
-                num = num.__add__(s)
-            else:
-                freq = freq.__add__(s)
-        if num:
-            num = int(num)
+        to_days = {
+            'years': 365.25,
+            'months': 30.5,
+            'weekday': 7.,
+            'days': 1.,
+            'hours': 1. / 24.,
+            'minutes': 1. / 24. / 60.,
+            'seconds': 1. / 24. / 60. / 60.,
+            'milliseconds': 1. / 24. / 60. / 60. * 1e-3,
+            }
+        if not len(offset.kwds):
+            return 1.
         else:
-            num = 1
-
-        return num, freq
+            # day of the week is not a multiplier, set to 1.
+            offset.kwds['weekday'] = 1.
+            return sum(n * to_days[u] for u, n in offset.kwds.items())
 
     def get_contribution(self, name):
         if name not in self.tseriesdict.keys():
@@ -715,34 +651,6 @@ class Model:
         except KeyError:
             print("Name not in tseriesdict, available names are: %s"
                   % self.tseriesdict.keys())
-
-    def sample(self, series, tindex):
-        """Sample the series so that the frequency is not higher that tindex.
-
-        Parameters
-        ----------
-        series: pd.Series
-            pandas series object.
-        tindex: pd.index
-            Pandas index object
-
-        Returns
-        -------
-        series: pd.Series
-
-
-        Notes
-        -----
-        Find the index closest to the tindex, and then return a selection
-        of series
-
-        """
-        f = interpolate.interp1d(series.index.asi8,
-                                 np.arange(0, series.index.size),
-                                 kind='nearest', bounds_error=False,
-                                 fill_value='extrapolate')
-        ind = np.unique(f(tindex.asi8).astype(int))
-        return series[ind]
 
     def plot(self, tmin=None, tmax=None, oseries=True, simulate=True):
         """
